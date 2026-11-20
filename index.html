@@ -1,0 +1,1330 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Supply Network Game</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://unpkg.com/react@18.3.1/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone@7.24.7/babel.min.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-database-compat.js"></script>
+</head><body class="bg-slate-100 text-slate-800"><div id="root"></div>
+<script>
+/* ========================= SETUP (edit this part) =========================
+   1) Paste the values of your Firebase web app below (Firebase console > Project settings > Your apps).
+      While the values still start with "PASTE" the game runs in LOCAL mode (data stays in this browser only - good for testing).
+   2) Choose your instructor password.                                                       */
+const firebaseConfig = {
+  apiKey: "AIzaSyBT3EumofcLtInfd-7NvX0QlsAD7_njIME",
+  authDomain: "logistics-gamev10.firebaseapp.com",
+  databaseURL: "https://logistics-gamev10-default-rtdb.europe-west1.firebasedatabase.app",
+  projectId: "logistics-gamev10",
+  appId: "1:625451538156:web:d1982391cc677397f4b7c9"
+};
+const INSTRUCTOR_PASSWORD = "LOG101";
+const NS = "supply2";   // data folder in the database. Change it to start a completely fresh game.
+/* ======================== end of setup ======================== */
+
+const USE_FIREBASE = !firebaseConfig.apiKey.startsWith("PASTE");
+
+/* Small stand-in for Firebase that stores everything in this browser (used when Firebase is not configured). */
+function makeLocalDB() {
+  const KEY = 'localdb-' + NS;
+  const load = () => { try { return JSON.parse(localStorage.getItem(KEY) || '{}'); } catch (e) { return {}; } };
+  const save = d => localStorage.setItem(KEY, JSON.stringify(d));
+  const parts = p => p.split('/').filter(Boolean);
+  const getAt = (d, p) => { let c = d; for (const k of parts(p)) { if (c == null || typeof c !== 'object') return null; c = c[k]; } return c === undefined ? null : c; };
+  const setAt = (d, p, v) => {
+    const ks = parts(p); if (!ks.length) return v;
+    let c = d;
+    ks.slice(0, -1).forEach(k => { if (c[k] == null || typeof c[k] !== 'object') c[k] = {}; c = c[k]; });
+    if (v === null || v === undefined) delete c[ks[ks.length - 1]]; else c[ks[ks.length - 1]] = v;
+    return d;
+  };
+  const listeners = [];
+  const snap = (p, v) => ({ val: () => (v === undefined ? null : JSON.parse(JSON.stringify(v))), exists: () => v !== null && v !== undefined, key: parts(p).pop() || null });
+  const notify = () => listeners.slice().forEach(l => l.cb(snap(l.path, getAt(load(), l.path))));
+  window.addEventListener('storage', e => { if (e.key === KEY) notify(); });
+  return {
+    ref: p => ({
+      once: async () => snap(p, getAt(load(), p)),
+      on: (ev, cb) => { listeners.push({ path: p, cb }); cb(snap(p, getAt(load(), p))); return cb; },
+      off: (ev, cb) => { const i = listeners.findIndex(l => l.cb === cb); if (i >= 0) listeners.splice(i, 1); },
+      set: async v => { const d = load(); save(p === '' ? (v || {}) : setAt(d, p, v === undefined ? null : JSON.parse(JSON.stringify(v)))); notify(); },
+      update: async v => { const d = load(); Object.keys(v).forEach(k => setAt(d, p + '/' + k, v[k] === undefined ? null : JSON.parse(JSON.stringify(v[k])))); save(d); notify(); },
+      transaction: async fn => {
+        const d = load(); const cur = getAt(d, p);
+        const res = fn(cur === null ? null : JSON.parse(JSON.stringify(cur)));
+        if (res === undefined) return { committed: false, snapshot: snap(p, cur) };
+        save(setAt(d, p, res)); notify();
+        return { committed: true, snapshot: snap(p, res) };
+      },
+    })
+  };
+}
+
+let rawDb;
+if (USE_FIREBASE) { firebase.initializeApp(firebaseConfig); rawDb = firebase.database(); }
+else { rawDb = makeLocalDB(); }
+const db = { ref: p => rawDb.ref(NS + (p ? '/' + p : '')) };
+
+/* ============================ GAME MODEL ============================ */
+const REGIONS = [
+  { id: 'R1', name: 'Pacific',  pos: 1 },
+  { id: 'R2', name: 'Mountain', pos: 2 },
+  { id: 'R3', name: 'Central',  pos: 3 },
+  { id: 'R4', name: 'South',    pos: 4 },
+  { id: 'R5', name: 'Atlantic', pos: 5 },
+];
+// Two products. capUse = how much factory capacity ONE unit uses (capacity is shared by both products).
+const PRODUCTS = [
+  { id: 'A', name: 'Product A (standard)', short: 'A', price: 40, holdF: 0.3, holdW: 0.5, penalty: 6,  shipMult: 1,   delMult: 1,   capUse: 1,   color: '#2563eb' },
+  { id: 'B', name: 'Product B (premium)',  short: 'B', price: 70, holdF: 0.7, holdW: 1.2, penalty: 12, shipMult: 1.6, delMult: 1.6, capUse: 1.5, color: '#d97706' },
+];
+const FACTORIES = [
+  { id: 'F1', name: 'Factory 1 (West)',    pos: 1, cap: 700, unitCost: { A: 12, B: 24 } },
+  { id: 'F2', name: 'Factory 2 (Central)', pos: 3, cap: 900, unitCost: { A: 13, B: 26 } },
+  { id: 'F3', name: 'Factory 3 (East)',    pos: 5, cap: 700, unitCost: { A: 11, B: 22 } },
+];
+const WAREHOUSES = REGIONS.map(r => ({ id: 'W' + r.id.slice(1), name: r.name + ' Warehouse', pos: r.pos }));
+const PARAMS = {
+  startCash: 60000,
+  openFactory: 5000, fixedFactory: 1000,
+  openWarehouse: 1000, fixedWarehouse: 200,
+  interest: 0.02,
+  leadStd: 2, leadExp: 1, expMult: 2.5,
+};
+const DEFAULT_SHIFT_ROUND = 4;      // demand profile changes from this round onwards (instructor can change it)
+const SHIFT_NEWS = 'Market analysts report a structural change in demand: Product B is taking off, Product A is maturing, and demand is moving towards the South and Atlantic regions.';
+
+const shipRate = (f, w, mode, p) => {
+  const base = (0.8 + 0.4 * Math.abs(f.pos - w.pos)) * p.shipMult;
+  return mode === 'exp' ? base * PARAMS.expMult : base;
+};
+const deliverRate = (w, r, p) => (1 + 0.7 * Math.abs(w.pos - r.pos)) * p.delMult;
+
+// ---- helpers
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+const toInt = v => { const n = parseInt(v, 10); return isNaN(n) ? 0 : n; };
+const r2 = x => Math.round(x * 100) / 100;
+const money = n => (n < 0 ? '-' : '') + '£' + Math.abs(Math.round(n)).toLocaleString();
+const sum = a => a.reduce((x, y) => x + y, 0);
+const mapObj = (o, fn) => { const r = {}; Object.keys(o).forEach(k => r[k] = fn(o[k], k)); return r; };
+const perProduct = fn => { const r = {}; PRODUCTS.forEach(p => r[p.id] = fn(p)); return r; };
+const slug = s => s.trim().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+const download = (filename, text, type) => {
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([text], { type }));
+  a.download = filename; document.body.appendChild(a); a.click(); a.remove();
+};
+const prodKey = (f, p) => f + '>' + p;
+const shipKey = (f, w, p) => f + '>' + w + '>' + p;
+
+/* ---------------- demand ----------------
+   Same for every team (generated from the seed). Up to round (shiftR-1) the "old" profile applies.
+   From round shiftR the profile CHANGES: product A flattens/declines, product B takes off, and demand
+   moves towards the South and Atlantic regions (regional level jump + new trends). */
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = a + 0x6D2B79F5 | 0;
+    let t = Math.imul(a ^ a >>> 15, 1 | a);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+const DEM = {
+  A: { base: [160, 220, 260, 190, 130], t1: [0.04, 0.03, 0.05, -0.01, 0.08], t2: [-0.03, -0.04, -0.02, -0.05, 0.02],
+       amp: [0.15, 0.10, 0.20, 0.10, 0.25], phase: [0, 1, 2, 3, 4], jump: [0.85, 0.95, 1.00, 1.15, 1.25] },
+  B: { base: [45, 65, 80, 55, 35],      t1: [0.06, 0.05, 0.04, 0.07, 0.05],  t2: [0.12, 0.10, 0.09, 0.15, 0.18],
+       amp: [0.20, 0.15, 0.15, 0.20, 0.30], phase: [2, 3, 4, 0, 1], jump: [1.00, 1.10, 1.15, 1.35, 1.50] },
+};
+function demandFor(seed, round, shiftR) {
+  const sh = shiftR || DEFAULT_SHIFT_ROUND;
+  const out = {};
+  PRODUCTS.forEach((p, pi) => {
+    const d = DEM[p.id];
+    out[p.id] = REGIONS.map((r, i) => {
+      const rnd = mulberry32(seed * 1000 + round * 10 + i + (pi === 1 ? 5 : 0));
+      const noise = (rnd() + rnd() + rnd() - 1.5) * 0.25;
+      const pre = Math.min(round, sh - 1);
+      const post = Math.max(0, round - (sh - 1));
+      const trend = Math.max(0.25, 1 + d.t1[i] * (pre - 1) + d.t2[i] * post);
+      const jump = post > 0 ? d.jump[i] : 1;
+      const season = 1 + d.amp[i] * Math.sin(2 * Math.PI * round / 6 + d.phase[i]);
+      return Math.max(0, Math.round(d.base[i] * trend * jump * season * (1 + noise)));
+    });
+  });
+  return out;
+}
+
+/* ------------- instructor changes between rounds -------------
+   game.changes = { r5: { demandPct:{A_R1:130}, penalty:{A:10}, price:{B:75}, unitCost:{F1_A:15}, msg:"..." }, ... }
+   A change saved under "rN" applies to round N and every later round, until another change overrides it. */
+function paramsForRound(game, round) {
+  const P = { price: perProduct(p => p.price), penalty: perProduct(p => p.penalty), unitCost: {}, demandMult: {} };
+  FACTORIES.forEach(f => { P.unitCost[f.id] = { ...f.unitCost }; });
+  PRODUCTS.forEach(p => { P.demandMult[p.id] = {}; REGIONS.forEach(r => { P.demandMult[p.id][r.id] = 1; }); });
+  const ch = (game && game.changes) || {};
+  Object.keys(ch).map(k => ({ r: toInt(k.slice(1)), v: ch[k] || {} })).sort((a, b) => a.r - b.r).forEach(e => {
+    if (e.r > round) return;
+    const v = e.v;
+    PRODUCTS.forEach(p => {
+      if (v.price && v.price[p.id] != null) P.price[p.id] = Number(v.price[p.id]);
+      if (v.penalty && v.penalty[p.id] != null) P.penalty[p.id] = Number(v.penalty[p.id]);
+      REGIONS.forEach(r => { if (v.demandPct && v.demandPct[p.id + '_' + r.id] != null) P.demandMult[p.id][r.id] = Number(v.demandPct[p.id + '_' + r.id]) / 100; });
+      FACTORIES.forEach(f => { if (v.unitCost && v.unitCost[f.id + '_' + p.id] != null) P.unitCost[f.id][p.id] = Number(v.unitCost[f.id + '_' + p.id]); });
+    });
+  });
+  return P;
+}
+function demandForGame(game, round) {
+  const base = demandFor(game.seed, round, game.shiftRound);
+  const P = paramsForRound(game, round);
+  const out = {};
+  PRODUCTS.forEach(p => { out[p.id] = base[p.id].map((v, i) => Math.max(0, Math.round(v * P.demandMult[p.id][REGIONS[i].id]))); });
+  return out;
+}
+
+/* ------------------------- team state ------------------------- */
+function initialState(name) {
+  return {
+    name, processed: 0, cash: PARAMS.startCash,
+    factories: {
+      F1: { open: false, stock: { A: 0, B: 0 } },
+      F2: { open: true,  stock: { A: 300, B: 100 } },
+      F3: { open: false, stock: { A: 0, B: 0 } },
+    },
+    warehouses: {
+      W1: { open: false, inv: { A: 0, B: 0 } },
+      W2: { open: true,  inv: { A: 280, B: 90 } },
+      W3: { open: false, inv: { A: 0, B: 0 } },
+      W4: { open: true,  inv: { A: 280, B: 90 } },
+      W5: { open: false, inv: { A: 0, B: 0 } },
+    },
+    ships: [],            // every shipment ever sent: {id,sent,arrive,from,wh,p,qty,mode,status:'transit'|'delivered'|'lost'}
+    assignment: { R1: 'W2', R2: 'W2', R3: 'W4', R4: 'W4', R5: 'W4' },
+    lastDecision: null,
+    history: [],
+  };
+}
+const inTransit = state => (state.ships || []).filter(s => s.status === 'transit');
+
+// Starting point of a team's form (and what is played if a team does not submit): repeat last round.
+function defaultDecision(state) {
+  const ld = state.lastDecision;
+  return {
+    factoryOpen: mapObj(state.factories, f => f.open),
+    warehouseOpen: mapObj(state.warehouses, w => w.open),
+    production: ld ? { ...ld.production } : {},
+    ship: ld ? JSON.parse(JSON.stringify(ld.ship)) : {},
+    assign: { ...state.assignment },
+  };
+}
+// Fill gaps of a (possibly old/partial) decision with the state's current values.
+function normDecision(state, dec) {
+  const d = dec || {};
+  return {
+    factoryOpen: mapObj(state.factories, (f, id) => (d.factoryOpen && d.factoryOpen[id] !== undefined) ? !!d.factoryOpen[id] : f.open),
+    warehouseOpen: mapObj(state.warehouses, (w, id) => (d.warehouseOpen && d.warehouseOpen[id] !== undefined) ? !!d.warehouseOpen[id] : w.open),
+    production: d.production || {},
+    ship: d.ship || {},
+    assign: mapObj(state.assignment, (w, id) => (d.assign && d.assign[id] !== undefined) ? d.assign[id] : w),
+  };
+}
+
+// Production per factory and product after the shared-capacity limit (product A is served first).
+function plannedProduction(dec) {
+  const out = {};
+  FACTORIES.forEach(f => {
+    out[f.id] = {};
+    let rem = f.cap;
+    PRODUCTS.forEach(p => {
+      let q = Math.max(0, toInt((dec.production || {})[prodKey(f.id, p.id)]));
+      q = dec.factoryOpen[f.id] ? Math.min(q, Math.floor(rem / p.capUse + 1e-9)) : 0;
+      rem -= q * p.capUse;
+      out[f.id][p.id] = q;
+    });
+  });
+  return out;
+}
+// Shipment lines that will actually be sent (limited by the stock available at the factory).
+function plannedShipments(state, dec) {
+  const prod = plannedProduction(dec);
+  const lines = [];
+  FACTORIES.forEach(f => {
+    if (!dec.factoryOpen[f.id]) return;
+    const avail = perProduct(p => (state.factories[f.id].open ? state.factories[f.id].stock[p.id] : 0) + prod[f.id][p.id]);
+    WAREHOUSES.forEach(w => {
+      if (!dec.warehouseOpen[w.id]) return;
+      PRODUCTS.forEach(p => {
+        const rt = dec.ship[shipKey(f.id, w.id, p.id)];
+        if (!rt) return;
+        const q = Math.min(Math.max(0, toInt(rt.qty)), avail[p.id]);
+        if (q <= 0) return;
+        avail[p.id] -= q;
+        lines.push({ from: f.id, wh: w.id, p: p.id, qty: q, mode: rt.mode === 'exp' ? 'exp' : 'std' });
+      });
+    });
+  });
+  return lines;
+}
+const arriveRound = (round, mode) => round + (mode === 'exp' ? PARAMS.leadExp : PARAMS.leadStd);
+
+function processRound(s0, decIn, demandRow, round, P) {
+  const s = JSON.parse(JSON.stringify(s0));
+  const dec = normDecision(s0, decIn);
+  const c = { revenue: 0, invest: 0, fixed: 0, production: 0, transport: 0, delivery: 0, holding: 0, penalty: 0, interest: 0 };
+  const prodRev = perProduct(() => 0);
+
+  // plan (uses the state BEFORE changes; a closed facility always holds zero stock)
+  const prodPlan = plannedProduction(dec);
+  const shipPlan = plannedShipments(s0, dec);
+  const assign = dec.assign;
+
+  // 1. open / close facilities (closing writes off stock)
+  FACTORIES.forEach(f => {
+    const cur = s.factories[f.id];
+    if (dec.factoryOpen[f.id] && !cur.open) { cur.open = true; c.invest += PARAMS.openFactory; }
+    else if (!dec.factoryOpen[f.id] && cur.open) { cur.open = false; cur.stock = perProduct(() => 0); }
+  });
+  WAREHOUSES.forEach(w => {
+    const cur = s.warehouses[w.id];
+    if (dec.warehouseOpen[w.id] && !cur.open) { cur.open = true; c.invest += PARAMS.openWarehouse; }
+    else if (!dec.warehouseOpen[w.id] && cur.open) { cur.open = false; cur.inv = perProduct(() => 0); }
+  });
+
+  // 2. production
+  FACTORIES.forEach(f => {
+    if (!s.factories[f.id].open) return;
+    PRODUCTS.forEach(p => {
+      const q = prodPlan[f.id][p.id];
+      s.factories[f.id].stock[p.id] += q;
+      c.production += q * P.unitCost[f.id][p.id];
+    });
+  });
+
+  // 3. shipping factory -> warehouse
+  shipPlan.forEach(l => {
+    const f = FACTORIES.find(x => x.id === l.from), w = WAREHOUSES.find(x => x.id === l.wh), p = PRODUCTS.find(x => x.id === l.p);
+    s.factories[l.from].stock[l.p] -= l.qty;
+    c.transport += l.qty * shipRate(f, w, l.mode, p);
+    s.ships.push({ id: s.ships.length + 1, sent: round, arrive: arriveRound(round, l.mode), from: l.from, wh: l.wh, p: l.p, qty: l.qty, mode: l.mode, status: 'transit' });
+  });
+
+  // 4. sales (each region buys from ONE warehouse; a short warehouse splits stock in proportion to demand)
+  const sold = perProduct(() => REGIONS.map(() => 0));
+  PRODUCTS.forEach(p => {
+    const byWh = {};
+    REGIONS.forEach((r, i) => { (byWh[assign[r.id]] = byWh[assign[r.id]] || []).push(i); });
+    Object.keys(byWh).forEach(whId => {
+      const w = s.warehouses[whId];
+      if (!w || !w.open) return;
+      const idxs = byWh[whId];
+      const total = sum(idxs.map(i => demandRow[p.id][i]));
+      idxs.forEach(i => { sold[p.id][i] = total <= w.inv[p.id] ? demandRow[p.id][i] : Math.floor(demandRow[p.id][i] * w.inv[p.id] / total); });
+      w.inv[p.id] -= sum(idxs.map(i => sold[p.id][i]));
+    });
+    REGIONS.forEach((r, i) => {
+      const wh = WAREHOUSES.find(x => x.id === assign[r.id]);
+      if (wh && sold[p.id][i] > 0) {
+        const rev = sold[p.id][i] * P.price[p.id];
+        c.revenue += rev; prodRev[p.id] += rev;
+        c.delivery += sold[p.id][i] * deliverRate(wh, r, p);
+      }
+    });
+  });
+  const lost = perProduct(p => demandRow[p.id].map((d, i) => d - sold[p.id][i]));
+  PRODUCTS.forEach(p => { c.penalty += sum(lost[p.id]) * P.penalty[p.id]; });
+
+  // 5. holding, fixed costs, interest
+  FACTORIES.forEach(f => { if (s.factories[f.id].open) { c.fixed += PARAMS.fixedFactory; PRODUCTS.forEach(p => { c.holding += s.factories[f.id].stock[p.id] * p.holdF; }); } });
+  WAREHOUSES.forEach(w => { if (s.warehouses[w.id].open) { c.fixed += PARAMS.fixedWarehouse; PRODUCTS.forEach(p => { c.holding += s.warehouses[w.id].inv[p.id] * p.holdW; }); } });
+  if (s.cash < 0) c.interest = -s.cash * PARAMS.interest;
+
+  const net = c.revenue - c.invest - c.fixed - c.production - c.transport - c.delivery - c.holding - c.penalty - c.interest;
+  s.cash = r2(s.cash + net);
+
+  // 6. shipments arriving at the start of next round (lost if the warehouse is closed by then)
+  const next = round + 1;
+  s.ships.forEach(sh => {
+    if (sh.status === 'transit' && sh.arrive <= next) {
+      const w = s.warehouses[sh.wh];
+      if (w.open) { w.inv[sh.p] += sh.qty; sh.status = 'delivered'; } else sh.status = 'lost';
+    }
+  });
+
+  const endStock = perProduct(p => sum(FACTORIES.map(f => s.factories[f.id].stock[p.id])) + sum(WAREHOUSES.map(w => s.warehouses[w.id].inv[p.id])));
+  s.history.push({
+    round, demand: demandRow, sold, lost, prodRev: mapObj(prodRev, v => r2(v)), endStock,
+    ...mapObj(c, v => r2(v)), net: r2(net), cash: s.cash,
+  });
+  s.assignment = assign;
+  s.lastDecision = { production: dec.production, ship: dec.ship, assign };
+  s.processed = round;
+  return s;
+}
+
+// Costs a team has committed to with its current draft (before sales).
+function previewCosts(state, dec, P) {
+  const d = normDecision(state, dec);
+  let invest = 0, fixed = 0, production = 0, transport = 0;
+  const prodPlan = plannedProduction(d);
+  FACTORIES.forEach(f => {
+    if (!d.factoryOpen[f.id]) return;
+    if (!state.factories[f.id].open) invest += PARAMS.openFactory;
+    fixed += PARAMS.fixedFactory;
+    PRODUCTS.forEach(p => { production += prodPlan[f.id][p.id] * P.unitCost[f.id][p.id]; });
+  });
+  WAREHOUSES.forEach(w => {
+    if (!d.warehouseOpen[w.id]) return;
+    if (!state.warehouses[w.id].open) invest += PARAMS.openWarehouse;
+    fixed += PARAMS.fixedWarehouse;
+  });
+  plannedShipments(state, d).forEach(l => {
+    transport += l.qty * shipRate(FACTORIES.find(x => x.id === l.from), WAREHOUSES.find(x => x.id === l.wh), l.mode, PRODUCTS.find(x => x.id === l.p));
+  });
+  return { invest, fixed, production, transport, total: invest + fixed + production + transport };
+}
+
+</script>
+<script type="text/babel">
+const { useState, useEffect } = React;
+
+const prodById = id => PRODUCTS.find(p => p.id === id);
+const facById = id => FACTORIES.find(f => f.id === id);
+const whById = id => WAREHOUSES.find(w => w.id === id);
+
+/* ============================ DATA SYNC ============================ */
+// Brings a team's saved state up to date with all CLOSED rounds.
+async function syncTeam(teamId, game) {
+  const lastClosed = Math.min(game.round - 1, game.totalRounds);
+  const stateRef = db.ref('state/' + teamId);
+  const snap = await stateRef.once('value');
+  const cur = snap.val();
+  if (!cur) return;
+  if (cur.processed >= lastClosed) return;
+  const decSnap = await db.ref('decisions/' + teamId).once('value');
+  const decs = decSnap.val() || {};
+  const res = await stateRef.transaction(c => {
+    if (!c) return c;
+    if (c.processed >= lastClosed) return; // somebody else already did it
+    let s = JSON.parse(c.json);
+    for (let r = s.processed + 1; r <= lastClosed; r++) {
+      const raw = decs['r' + r];
+      const dec = raw ? JSON.parse(raw) : defaultDecision(s);
+      s = processRound(s, dec, demandForGame(game, r), r, paramsForRound(game, r));
+    }
+    return { processed: s.processed, json: JSON.stringify(s) };
+  });
+  const fin = res.snapshot.val();
+  if (fin) {
+    const s = JSON.parse(fin.json);
+    await db.ref('leaderboard/' + teamId).update({ name: s.name, cash: s.cash, rounds: s.processed });
+  }
+}
+async function syncAllTeams(game) {
+  const snap = await db.ref('teams').once('value');
+  const ids = Object.keys(snap.val() || {});
+  for (const id of ids) { await syncTeam(id, game); }
+}
+
+/* ============================ UI PIECES ============================ */
+const Card = ({ title, right, children }) => (
+  <div className="bg-white rounded-xl shadow p-5 mb-5">
+    {(title || right) && (
+      <div className="flex justify-between items-center mb-3">
+        <h2 className="text-lg font-bold text-slate-800">{title}</h2>{right}
+      </div>)}
+    {children}
+  </div>
+);
+const NumInput = ({ value, onChange, max, disabled }) => (
+  <input type="number" min="0" max={max} disabled={disabled}
+    value={value ? value : ''} placeholder="0"
+    onChange={e => onChange(clamp(toInt(e.target.value), 0, max !== undefined ? Math.max(0, max) : 1e9))}
+    className="w-24 px-2 py-1 border border-slate-300 rounded text-right disabled:bg-slate-100" />
+);
+const ProdBadge = ({ id }) => {
+  const p = prodById(id);
+  return <span className="inline-block text-xs font-bold px-1.5 py-0.5 rounded" style={{ background: p.color + '22', color: p.color }}>{p.short}</span>;
+};
+const ModeBadge = ({ mode }) => mode === 'exp'
+  ? <span className="inline-block text-xs font-semibold px-1.5 py-0.5 rounded bg-orange-100 text-orange-700">⚡ Express</span>
+  : <span className="inline-block text-xs px-1.5 py-0.5 rounded bg-slate-100 text-slate-600">Standard</span>;
+
+function newsItems(game) {
+  const items = [];
+  const ch = game.changes || {};
+  Object.keys(ch).forEach(k => { const m = (ch[k] || {}).msg; if (m) items.push({ r: toInt(k.slice(1)), msg: m }); });
+  const sh = game.shiftRound || DEFAULT_SHIFT_ROUND;
+  if (game.announceShift && game.round >= sh - 1) items.push({ r: sh, msg: SHIFT_NEWS });
+  return items.sort((a, b) => a.r - b.r);
+}
+function NewsBox({ game }) {
+  const items = newsItems(game);
+  if (!items.length) return null;
+  return (
+    <div className="bg-sky-50 border border-sky-300 rounded-xl p-4 mb-5">
+      <div className="font-semibold text-sky-900 mb-2">📣 News from the instructor</div>
+      <ul className="text-sm text-sky-900 space-y-1">
+        {items.map((it, i) => (
+          <li key={i}><b>From round {it.r}</b> <span className="text-sky-700">({it.r <= game.round ? 'in effect' : 'upcoming'})</span>: {it.msg}</li>))}
+      </ul>
+    </div>
+  );
+}
+
+function Leaderboard({ rows, myId }) {
+  const sorted = [...rows].sort((a, b) => b.cash - a.cash);
+  if (!sorted.length) return <p className="text-slate-500 text-sm">No teams yet.</p>;
+  return (
+    <div className="space-y-2">
+      {sorted.map((t, i) => (
+        <div key={t.id} className={`flex justify-between items-center px-4 py-2 rounded ${t.id === myId ? 'bg-indigo-100 border-2 border-indigo-500' : i < 3 ? 'bg-amber-50 border border-amber-300' : 'bg-slate-50'}`}>
+          <div className="flex items-center gap-3">
+            <span className="font-bold text-lg w-8">#{i + 1}</span>
+            <div>
+              <div className="font-semibold">{t.name}</div>
+              <div className="text-xs text-slate-500">{t.rounds} round{t.rounds === 1 ? '' : 's'} completed</div>
+            </div>
+          </div>
+          <span className={`font-semibold text-lg ${t.cash >= 0 ? 'text-green-700' : 'text-red-600'}`}>{money(t.cash)}</span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+/* ============================ MAP ============================ */
+// Save the map picture as "supply-map.png" in the SAME folder as this HTML file.
+const MAP_FILE = 'supply-map.png';
+function MapCard({ bare }) {
+  const [failed, setFailed] = useState(false);
+  const body = (
+    <div>
+      {failed ? (
+        <p className="text-sm text-amber-700 bg-amber-50 border border-amber-200 p-3 rounded mb-3">
+          Map image not found. Save the map picture as <b>{MAP_FILE}</b> in the same folder as this HTML file (and upload it together with the HTML file if you host the game online).
+        </p>
+      ) : (
+        <img src={MAP_FILE} alt="Map of the five regions (Pacific, Mountain, Central, South, Atlantic) and the three factory locations"
+          className="w-full rounded-lg border border-slate-200 mb-3" onError={() => setFailed(true)} />
+      )}
+      <p className="text-xs text-slate-600">
+        Five regions: Pacific, Mountain, Central, South and Atlantic. Possible factories: <b>Factory 1 (West, in Pacific)</b>, <b>Factory 2 (Central)</b> and <b>Factory 3 (East, in Atlantic)</b>.
+        A warehouse can be opened in each region. You sell <b>two products</b> (A and B) that share the factories' capacity. Costs are listed on the "Game info &amp; demand" tab.
+      </p>
+    </div>
+  );
+  return bare ? <div className="mb-5">{body}</div> : <Card title="🗺️ The network: regions and factories">{body}</Card>;
+}
+
+/* ======================== DEMAND HISTORY ======================== */
+// Six periods "before the game" (-6 ... -1), generated from the same seed.
+const HIST_N = 6;
+const pastDemand = (seed, pid) => {
+  const rows = [];
+  for (let k = HIST_N; k >= 1; k--) rows.push({ label: '−' + k, demand: demandFor(seed, 1 - k, DEFAULT_SHIFT_ROUND)[pid] });
+  return rows;
+};
+const REGION_COLORS = ['#2563eb', '#16a34a', '#d97706', '#dc2626', '#7c3aed'];
+
+function DemandBlock({ p, seed, realized }) {
+  const past = pastDemand(seed, p.id);
+  const live = (realized || []).map(h => ({ label: 'R' + h.round, demand: h.demand[p.id] }));
+  const rows = [...past, ...live];
+  const avg = REGIONS.map((r, i) => Math.round(sum(past.map(x => x.demand[i])) / past.length));
+  const chg = REGIONS.map((r, i) => {
+    const a = sum(past.slice(0, 3).map(x => x.demand[i])) / 3;
+    const b = sum(past.slice(-3).map(x => x.demand[i])) / 3;
+    return a > 0 ? Math.round((b / a - 1) * 100) : 0;
+  });
+  const W = 640, H = 220, L = 44, R = 12, T = 12, B = 28;
+  const maxV = (Math.max(...rows.flatMap(r => r.demand)) * 1.1) || 1;
+  const x = idx => L + (rows.length === 1 ? 0 : idx * (W - L - R) / (rows.length - 1));
+  const y = v => T + (H - T - B) * (1 - v / maxV);
+  const splitX = live.length > 0 ? (x(past.length - 1) + x(past.length)) / 2 : null;
+  return (
+    <div className="mb-8">
+      <h3 className="font-bold text-slate-800 mb-2 flex items-center gap-2"><ProdBadge id={p.id} /> {p.name}: demand by region (units per period)</h3>
+      <svg viewBox={`0 0 ${W} ${H}`} className="w-full h-auto mb-2">
+        {[0, 0.25, 0.5, 0.75, 1].map(f => {
+          const v = maxV * f;
+          return (<g key={f}>
+            <line x1={L} x2={W - R} y1={y(v)} y2={y(v)} stroke="#e2e8f0" />
+            <text x={L - 6} y={y(v) + 4} fontSize="10" textAnchor="end" fill="#64748b">{Math.round(v)}</text>
+          </g>);
+        })}
+        {rows.map((r, i) => <text key={i} x={x(i)} y={H - 8} fontSize="10" textAnchor="middle" fill="#64748b">{r.label}</text>)}
+        {splitX !== null && <line x1={splitX} x2={splitX} y1={T} y2={H - B} stroke="#94a3b8" strokeDasharray="4 3" />}
+        {REGIONS.map((reg, i) => (
+          <polyline key={reg.id} fill="none" stroke={REGION_COLORS[i]} strokeWidth="2"
+            points={rows.map((r, j) => `${x(j)},${y(r.demand[i])}`).join(' ')} />))}
+        {REGIONS.map((reg, i) => rows.map((r, j) => (
+          <circle key={reg.id + j} cx={x(j)} cy={y(r.demand[i])} r="2.5" fill={REGION_COLORS[i]} />)))}
+      </svg>
+      <div className="flex flex-wrap gap-4 text-xs mb-3">
+        {REGIONS.map((r, i) => (
+          <span key={r.id} className="flex items-center gap-1"><span className="inline-block w-3 h-3 rounded-full" style={{ background: REGION_COLORS[i] }}></span>{r.name}</span>))}
+      </div>
+      <div className="overflow-x-auto">
+        <table className="w-full text-sm">
+          <thead className="bg-slate-50 text-slate-600">
+            <tr>
+              <th className="px-2 py-1 text-left">Period</th>
+              {REGIONS.map((r, i) => <th key={r.id} className="px-2 py-1 text-right" style={{ color: REGION_COLORS[i] }}>{r.name}</th>)}
+              <th className="px-2 py-1 text-right">Total</th>
+            </tr>
+          </thead>
+          <tbody>
+            {past.map(r => (
+              <tr key={r.label} className="border-t text-right">
+                <td className="px-2 py-1 text-left">{r.label}</td>
+                {r.demand.map((d, i) => <td key={i} className="px-2 py-1">{d}</td>)}
+                <td className="px-2 py-1 font-semibold">{sum(r.demand)}</td>
+              </tr>))}
+            <tr className="border-t-2 border-slate-300 text-right bg-slate-50 font-semibold">
+              <td className="px-2 py-1 text-left">Average (periods −6 to −1)</td>
+              {avg.map((a, i) => <td key={i} className="px-2 py-1">{a}</td>)}
+              <td className="px-2 py-1">{sum(avg)}</td>
+            </tr>
+            <tr className="text-right bg-slate-50">
+              <td className="px-2 py-1 text-left">Last 3 vs first 3 periods</td>
+              {chg.map((c, i) => <td key={i} className={`px-2 py-1 ${c > 0 ? 'text-green-700' : c < 0 ? 'text-red-600' : ''}`}>{c > 0 ? '+' : ''}{c}%</td>)}
+              <td className="px-2 py-1"></td>
+            </tr>
+            {live.map(r => (
+              <tr key={r.label} className="border-t text-right bg-indigo-50">
+                <td className="px-2 py-1 text-left">{r.label} (actual)</td>
+                {r.demand.map((d, i) => <td key={i} className="px-2 py-1">{d}</td>)}
+                <td className="px-2 py-1 font-semibold">{sum(r.demand)}</td>
+              </tr>))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+function DemandHistory({ seed, realized, bare }) {
+  const body = (
+    <div>
+      <p className="text-xs text-slate-600 mb-4">
+        Periods <b>−6 … −1</b> happened before the game starts (−1 is the most recent). Rows starting with <b>R</b> are actual game rounds and appear as they are played.
+        Each product and region has its own trend, seasonal swings and random noise. <b>Demand patterns can change during the game</b>, so keep watching the actual figures and do not assume the past will simply continue.
+      </p>
+      {PRODUCTS.map(p => <DemandBlock key={p.id} p={p} seed={seed} realized={realized} />)}
+    </div>
+  );
+  return bare
+    ? <div className="mt-6 pt-5 border-t"><h2 className="text-lg font-bold text-slate-800 mb-3">📈 Past demand by product and region</h2>{body}</div>
+    : <Card title="📈 Demand history by product and region">{body}</Card>;
+}
+
+/* ============================== LOGIN ============================== */
+function Login({ game, leaderboard, onLogin, onInstructor }) {
+  const [name, setName] = useState('');
+  const [pass, setPass] = useState('');
+  const [err, setErr] = useState('');
+  const [busy, setBusy] = useState(false);
+
+  const create = async () => {
+    setErr('');
+    const id = slug(name);
+    if (!id || !pass.trim()) { setErr('Enter a team name and a team passcode.'); return; }
+    setBusy(true);
+    try {
+      const ex = await db.ref('teams/' + id).once('value');
+      if (ex.exists()) { setErr('That team name is taken. Use "Join" if it is your team.'); setBusy(false); return; }
+      const st = initialState(name.trim());
+      await db.ref('teams/' + id).set({ name: name.trim(), pass: pass.trim() });
+      await db.ref('state/' + id).set({ processed: 0, json: JSON.stringify(st) });
+      await db.ref('leaderboard/' + id).set({ name: name.trim(), cash: st.cash, rounds: 0 });
+      onLogin({ id, name: name.trim() });
+    } catch (e) { setErr('Error: ' + e.message); }
+    setBusy(false);
+  };
+  const join = async () => {
+    setErr('');
+    const id = slug(name);
+    if (!id) { setErr('Enter your team name.'); return; }
+    setBusy(true);
+    try {
+      const t = (await db.ref('teams/' + id).once('value')).val();
+      if (!t) setErr('Team not found.');
+      else if (t.pass !== pass.trim()) setErr('Wrong passcode.');
+      else onLogin({ id, name: t.name });
+    } catch (e) { setErr('Error: ' + e.message); }
+    setBusy(false);
+  };
+
+  return (
+    <div className="min-h-screen p-6">
+      <div className="max-w-3xl mx-auto">
+        <div className="bg-white rounded-xl shadow-lg p-8 mb-5">
+          <h1 className="text-3xl font-bold text-slate-800 mb-1">🏭 Supply Network Game</h1>
+          <p className="text-slate-600 mb-4">Run a network of factories and warehouses that sells <b>two products</b> in five regions. Your score is your final <b>cash position</b>.</p>
+          <MapCard bare />
+          {game === null && <p className="text-amber-700 bg-amber-50 p-3 rounded">No game has been started yet. The instructor must create one first (see "Instructor login" below).</p>}
+          {game && (
+            <>
+              <p className="text-sm text-slate-600 mb-4">Game status: round <b>{Math.min(game.round, game.totalRounds)}</b> of <b>{game.totalRounds}</b>{game.round > game.totalRounds ? ' (finished)' : ''}</p>
+              <div className="grid md:grid-cols-2 gap-3 mb-3">
+                <input value={name} onChange={e => setName(e.target.value)} placeholder="Team name" className="px-3 py-2 border border-slate-300 rounded" />
+                <input value={pass} onChange={e => setPass(e.target.value)} placeholder="Team passcode" className="px-3 py-2 border border-slate-300 rounded" />
+              </div>
+              <div className="flex gap-3">
+                <button disabled={busy} onClick={join} className="flex-1 bg-indigo-600 text-white py-2 rounded font-semibold hover:bg-indigo-700 disabled:bg-slate-300">Join existing team</button>
+                <button disabled={busy || game.round > 1} onClick={create} className="flex-1 bg-emerald-600 text-white py-2 rounded font-semibold hover:bg-emerald-700 disabled:bg-slate-300" title={game.round > 1 ? 'New teams can only be created during round 1' : ''}>Create new team</button>
+              </div>
+              {err && <p className="text-red-600 text-sm mt-3">{err}</p>}
+            </>
+          )}
+          {game && <DemandHistory seed={game.seed} bare />}
+          <button onClick={onInstructor} className="text-xs text-slate-400 underline mt-5">Instructor login</button>
+        </div>
+        <Card title="🏆 Leaderboard"><Leaderboard rows={leaderboard} /></Card>
+      </div>
+    </div>
+  );
+}
+
+/* ====================== SHIPMENTS IN TRANSIT ====================== */
+// Arrival plan: stock on hand now + shipments already on the way + (optionally) this round's draft shipments.
+function ArrivalPlan({ state, dec, round }) {
+  const nd = dec ? normDecision(state, dec) : null;
+  const rows = {}; const cols = new Set();
+  const add = (wh, arrive, pid, qty, planned, mode) => {
+    rows[wh] = rows[wh] || {};
+    rows[wh][arrive] = rows[wh][arrive] || [];
+    rows[wh][arrive].push({ pid, qty, planned, mode });
+    cols.add(arrive);
+  };
+  inTransit(state).forEach(s => add(s.wh, s.arrive, s.p, s.qty, false, s.mode));
+  if (nd) plannedShipments(state, nd).forEach(l => add(l.wh, arriveRound(round, l.mode), l.p, l.qty, true, l.mode));
+  [round + 1, round + 2].forEach(c => cols.add(c));
+  const colList = [...cols].sort((a, b) => a - b);
+  const whIds = WAREHOUSES.filter(w => (nd ? nd.warehouseOpen[w.id] : state.warehouses[w.id].open) || rows[w.id]).map(w => w.id);
+  return (
+    <div className="overflow-x-auto">
+      <table className="w-full text-sm">
+        <thead className="bg-slate-50 text-slate-600"><tr>
+          <th className="text-left px-2 py-1">Warehouse</th>
+          <th className="px-2 py-1">On hand now</th>
+          {colList.map(c => <th key={c} className="px-2 py-1">Arrives start of round {c}</th>)}
+        </tr></thead>
+        <tbody>
+          {whIds.map(id => {
+            const w = whById(id); const cur = state.warehouses[id];
+            return (
+              <tr key={id} className="border-t text-center align-top">
+                <td className="px-2 py-1 text-left">{w.name}{!cur.open && <span className="text-xs text-amber-700"> (opening)</span>}</td>
+                <td className="px-2 py-1">{PRODUCTS.map(p => <div key={p.id}><ProdBadge id={p.id} /> {cur.open ? cur.inv[p.id] : 0}</div>)}</td>
+                {colList.map(c => (
+                  <td key={c} className="px-2 py-1">
+                    {(rows[id] && rows[id][c]) ? rows[id][c].map((e, i) => (
+                      <div key={i} className={e.planned ? 'text-slate-500 italic' : 'font-semibold'}>
+                        <ProdBadge id={e.pid} /> +{e.qty} {e.mode === 'exp' && '⚡'}{e.planned && <span className="text-xs"> (your draft)</span>}
+                      </div>)) : <span className="text-slate-300">—</span>}
+                  </td>))}
+              </tr>);
+          })}
+        </tbody>
+      </table>
+      <p className="text-xs text-slate-500 mt-2">Bold = already on the way. Italic = in your current draft (it only happens once you submit and the round is closed). ⚡ = express.</p>
+    </div>
+  );
+}
+
+// Route diagram of the shipments that are on the way now.
+function RouteDiagram({ state }) {
+  const ships = inTransit(state);
+  const W = 760, H = 360, fx = 110, wx = 650;
+  const fy = { F1: 70, F2: 180, F3: 290 };
+  const wy = {}; WAREHOUSES.forEach((w, i) => { wy[w.id] = 40 + i * 70; });
+  const groups = {};
+  ships.forEach(s => {
+    const k = s.from + '|' + s.wh + '|' + s.mode + '|' + s.arrive;
+    groups[k] = groups[k] || { from: s.from, wh: s.wh, mode: s.mode, arrive: s.arrive, items: {} };
+    groups[k].items[s.p] = (groups[k].items[s.p] || 0) + s.qty;
+  });
+  const lines = Object.values(groups);
+  return (
+    <div>
+      <svg viewBox={`0 0 ${W} ${H}`} className="w-full h-auto border border-slate-200 rounded-lg bg-slate-50">
+        {FACTORIES.map(f => {
+          const st = state.factories[f.id];
+          return (<g key={f.id}>
+            <rect x={fx - 80} y={fy[f.id] - 28} width="160" height="56" rx="8" fill={st.open ? '#dcfce7' : '#f1f5f9'} stroke={st.open ? '#16a34a' : '#cbd5e1'} />
+            <text x={fx} y={fy[f.id] - 8} textAnchor="middle" fontSize="12" fontWeight="bold" fill="#1e293b">{f.name}</text>
+            <text x={fx} y={fy[f.id] + 10} textAnchor="middle" fontSize="11" fill="#475569">{st.open ? `stock A ${st.stock.A} · B ${st.stock.B}` : 'closed'}</text>
+          </g>);
+        })}
+        {WAREHOUSES.map(w => {
+          const st = state.warehouses[w.id];
+          return (<g key={w.id}>
+            <rect x={wx - 80} y={wy[w.id] - 24} width="160" height="48" rx="8" fill={st.open ? '#dbeafe' : '#f1f5f9'} stroke={st.open ? '#2563eb' : '#cbd5e1'} />
+            <text x={wx} y={wy[w.id] - 5} textAnchor="middle" fontSize="12" fontWeight="bold" fill="#1e293b">{w.name.replace(' Warehouse', '')} WH</text>
+            <text x={wx} y={wy[w.id] + 12} textAnchor="middle" fontSize="11" fill="#475569">{st.open ? `A ${st.inv.A} · B ${st.inv.B}` : 'closed'}</text>
+          </g>);
+        })}
+        {lines.map((l, i) => {
+          const x1 = fx + 80, y1 = fy[l.from], x2 = wx - 80, y2 = wy[l.wh];
+          const t = 0.30 + 0.2 * FACTORIES.findIndex(f => f.id === l.from) + (l.mode === 'exp' ? 0.06 : 0);
+          const mx = x1 + (x2 - x1) * t, my = y1 + (y2 - y1) * t;
+          const total = sum(Object.values(l.items));
+          const col = l.mode === 'exp' ? '#ea580c' : '#2563eb';
+          const label = Object.keys(l.items).map(k => k + ' ' + l.items[k]).join(' · ') + ' → R' + l.arrive;
+          return (<g key={i}>
+            <line x1={x1} y1={y1} x2={x2} y2={y2} stroke={col} strokeWidth={1.5 + Math.min(5, total / 100)} strokeDasharray={l.mode === 'exp' ? '' : '7 4'} opacity="0.75" />
+            <text x={mx} y={my} textAnchor="middle" fontSize="11" fontWeight="bold" fill={col} stroke="#f8fafc" strokeWidth="4" paintOrder="stroke">{label}</text>
+          </g>);
+        })}
+        {!lines.length && <text x={W / 2} y={H / 2} textAnchor="middle" fontSize="14" fill="#94a3b8">No shipments are on the way right now</text>}
+      </svg>
+      <div className="flex flex-wrap gap-5 text-xs text-slate-600 mt-2">
+        <span><span className="inline-block w-6 border-t-2 border-dashed border-blue-600 align-middle mr-1"></span>Standard (arrives {PARAMS.leadStd} rounds after sending)</span>
+        <span><span className="inline-block w-6 border-t-2 border-orange-600 align-middle mr-1"></span>⚡ Express ({PARAMS.leadExp} round)</span>
+        <span>Label: units per product → round at whose start they arrive</span>
+      </div>
+    </div>
+  );
+}
+
+function ShipmentsTab({ state, game }) {
+  const transit = inTransit(state).sort((a, b) => a.arrive - b.arrive);
+  const log = [...(state.ships || [])].sort((a, b) => b.sent - a.sent || b.id - a.id);
+  const statusBadge = s => s === 'transit' ? <span className="text-xs px-1.5 py-0.5 rounded bg-blue-100 text-blue-700">On the way</span>
+    : s === 'delivered' ? <span className="text-xs px-1.5 py-0.5 rounded bg-green-100 text-green-700">Delivered</span>
+    : <span className="text-xs px-1.5 py-0.5 rounded bg-red-100 text-red-700">Lost (warehouse closed)</span>;
+  return (
+    <div>
+      <Card title="🚚 Shipments on the way">
+        <p className="text-xs text-slate-600 mb-3">Goods in transit cannot be sold. A shipment is added to the warehouse's inventory at the start of its arrival round. If the warehouse is closed by then, the shipment is lost.</p>
+        <RouteDiagram state={state} />
+        {transit.length > 0 && (
+          <div className="overflow-x-auto mt-4">
+            <table className="w-full text-sm">
+              <thead className="bg-slate-50 text-slate-600"><tr>
+                <th className="px-2 py-1 text-left">From</th><th className="px-2 py-1 text-left">To</th><th className="px-2 py-1">Product</th>
+                <th className="px-2 py-1 text-right">Units</th><th className="px-2 py-1">Mode</th><th className="px-2 py-1">Sent in round</th><th className="px-2 py-1">Arrives at start of round</th></tr></thead>
+              <tbody>
+                {transit.map(s => (
+                  <tr key={s.id} className="border-t text-center">
+                    <td className="px-2 py-1 text-left">{facById(s.from).name}</td><td className="px-2 py-1 text-left">{whById(s.wh).name}</td>
+                    <td className="px-2 py-1"><ProdBadge id={s.p} /></td><td className="px-2 py-1 text-right font-semibold">{s.qty}</td>
+                    <td className="px-2 py-1"><ModeBadge mode={s.mode} /></td><td className="px-2 py-1">{s.sent}</td>
+                    <td className="px-2 py-1 font-semibold">{s.arrive}{s.arrive === game.round + 1 ? ' (next round)' : ''}</td>
+                  </tr>))}
+              </tbody>
+            </table>
+          </div>)}
+      </Card>
+      <Card title="Arrival plan by warehouse"><ArrivalPlan state={state} dec={null} round={game.round} /></Card>
+      <Card title="Shipment history">
+        {!log.length && <p className="text-sm text-slate-500">No shipments sent yet.</p>}
+        {log.length > 0 && (
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead className="bg-slate-50 text-slate-600"><tr>
+                <th className="px-2 py-1">Sent in round</th><th className="px-2 py-1 text-left">From</th><th className="px-2 py-1 text-left">To</th><th className="px-2 py-1">Product</th>
+                <th className="px-2 py-1 text-right">Units</th><th className="px-2 py-1">Mode</th><th className="px-2 py-1">Arrival round</th><th className="px-2 py-1">Status</th></tr></thead>
+              <tbody>
+                {log.map(s => (
+                  <tr key={s.id} className="border-t text-center">
+                    <td className="px-2 py-1">{s.sent}</td><td className="px-2 py-1 text-left">{facById(s.from).name}</td><td className="px-2 py-1 text-left">{whById(s.wh).name}</td>
+                    <td className="px-2 py-1"><ProdBadge id={s.p} /></td><td className="px-2 py-1 text-right">{s.qty}</td>
+                    <td className="px-2 py-1"><ModeBadge mode={s.mode} /></td><td className="px-2 py-1">{s.arrive}</td><td className="px-2 py-1">{statusBadge(s.status)}</td>
+                  </tr>))}
+              </tbody>
+            </table>
+          </div>)}
+      </Card>
+    </div>
+  );
+}
+
+/* ============================ DECISIONS ============================ */
+function DecisionTab({ team, state, game }) {
+  const round = game.round;
+  const P = paramsForRound(game, round);
+  const [dec, setDec] = useState(null);
+  const [submitted, setSubmitted] = useState(false);
+  const [dirty, setDirty] = useState(false);
+  const [msg, setMsg] = useState('');
+
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      const s = await db.ref('decisions/' + team.id + '/r' + round).once('value');
+      if (!alive) return;
+      if (s.exists()) { setDec(normDecision(state, JSON.parse(s.val()))); setSubmitted(true); }
+      else { setDec(normDecision(state, defaultDecision(state))); setSubmitted(false); }
+      setDirty(false);
+    })();
+    return () => { alive = false; };
+  }, [team.id, round, state.processed]);
+
+  if (round > game.totalRounds) return <Card title="Game finished">The game is over. Check the Results and Leaderboard tabs. Your final cash: <b>{money(state.cash)}</b>.</Card>;
+  if (!dec) return <p className="text-slate-500">Loading…</p>;
+  if (state.processed < round - 1) return <p className="text-slate-500">Updating your results…</p>;
+
+  const upd = fn => { const d = JSON.parse(JSON.stringify(dec)); fn(d); setDec(d); setDirty(true); setMsg(''); };
+  const prod = plannedProduction(dec);
+  const lines = plannedShipments(state, dec);
+  const costs = previewCosts(state, dec, P);
+  const lastHist = state.history[state.history.length - 1];
+
+  const shippedQ = (fid, pid) => sum(WAREHOUSES.map(w => { const l = dec.ship[shipKey(fid, w.id, pid)]; return l ? Math.max(0, toInt(l.qty)) : 0; }));
+  const stockNow = (fid, pid) => (state.factories[fid].open ? state.factories[fid].stock[pid] : 0);
+
+  const submit = async () => {
+    try {
+      await db.ref('decisions/' + team.id + '/r' + round).set(JSON.stringify(dec));
+      setSubmitted(true); setDirty(false); setMsg('Saved. You can change it until the instructor closes the round.');
+    } catch (e) { setMsg('Error: ' + e.message); }
+  };
+
+  const openWh = WAREHOUSES.filter(w => dec.warehouseOpen[w.id]);
+
+  return (
+    <div>
+      <NewsBox game={game} />
+      <div className={`rounded-xl p-3 mb-5 text-sm ${submitted && !dirty ? 'bg-green-50 border border-green-300 text-green-800' : 'bg-amber-50 border border-amber-300 text-amber-900'}`}>
+        {submitted && !dirty ? `✅ Your decisions for round ${round} are saved. Resubmit any time before the instructor closes the round.`
+          : submitted ? '✏️ You have unsaved changes to your submitted decisions.'
+          : `⚠️ Not submitted yet. If you do nothing, the previous round's decisions are repeated.`}
+      </div>
+
+      <Card title={`Round ${round}: current prices`}>
+        <div className="grid grid-cols-2 gap-3 text-sm">
+          {PRODUCTS.map(p => (
+            <div key={p.id} className="bg-slate-50 rounded p-3">
+              <ProdBadge id={p.id} /> <b>{p.name}</b><br />
+              Selling price <b>{money(P.price[p.id])}</b> · stock-out penalty <b>{money(P.penalty[p.id])}</b>/unit lost
+            </div>))}
+        </div>
+        {lastHist && (
+          <p className="text-xs text-slate-600 mt-3">Last round (R{lastHist.round}) demand — {PRODUCTS.map(p => `${p.short}: ${sum(lastHist.demand[p.id])}`).join(', ')}; unsold due to stock-out — {PRODUCTS.map(p => `${p.short}: ${sum(lastHist.lost[p.id])}`).join(', ')}.</p>)}
+      </Card>
+
+      <Card title="1. Factories: open/close and production">
+        <p className="text-xs text-slate-600 mb-3">Both products share each factory's capacity. One unit of A uses 1 capacity unit; one unit of B uses 1.5. Opening costs {money(PARAMS.openFactory)}, upkeep {money(PARAMS.fixedFactory)}/round. Closing writes off the stock.</p>
+        <div className="grid md:grid-cols-3 gap-4">
+          {FACTORIES.map(f => {
+            const st = state.factories[f.id]; const open = dec.factoryOpen[f.id];
+            const qA = Math.max(0, toInt(dec.production[prodKey(f.id, 'A')])), qB = Math.max(0, toInt(dec.production[prodKey(f.id, 'B')]));
+            const used = prod[f.id].A * 1 + prod[f.id].B * 1.5;
+            return (
+              <div key={f.id} className={`border rounded-lg p-3 ${open ? 'border-green-400 bg-green-50' : 'border-slate-200'}`}>
+                <label className="font-semibold flex items-center gap-2">
+                  <input type="checkbox" checked={open} onChange={e => upd(d => { d.factoryOpen[f.id] = e.target.checked; })} /> {f.name}
+                </label>
+                <div className="text-xs text-slate-500 mb-2">{st.open ? `Open · stock A ${st.stock.A} / B ${st.stock.B}` : (open ? `Will open (${money(PARAMS.openFactory)})` : 'Closed')} · capacity {f.cap}</div>
+                {open && (<>
+                  {PRODUCTS.map(p => {
+                    const other = p.id === 'A' ? qB * 1.5 : qA;
+                    const max = Math.floor((f.cap - other) / p.capUse + 1e-9);
+                    return (
+                      <div key={p.id} className="flex items-center justify-between text-sm mb-1">
+                        <span><ProdBadge id={p.id} /> produce <span className="text-xs text-slate-500">({money(P.unitCost[f.id][p.id])}/u)</span></span>
+                        <NumInput value={dec.production[prodKey(f.id, p.id)]} max={max} onChange={v => upd(d => { d.production[prodKey(f.id, p.id)] = v; })} />
+                      </div>);
+                  })}
+                  <div className="h-2 bg-slate-200 rounded overflow-hidden mt-2"><div className="h-2" style={{ width: Math.min(100, used / f.cap * 100) + '%', background: used > f.cap * 0.95 ? '#dc2626' : '#16a34a' }}></div></div>
+                  <div className="text-xs text-slate-500">Capacity used {Math.round(used)} / {f.cap}</div>
+                </>)}
+              </div>);
+          })}
+        </div>
+      </Card>
+
+      <Card title="2. Warehouses: open/close">
+        <p className="text-xs text-slate-600 mb-3">Opening costs {money(PARAMS.openWarehouse)}, upkeep {money(PARAMS.fixedWarehouse)}/round. Closing writes off its stock, and shipments arriving at a closed warehouse are lost.</p>
+        <div className="grid md:grid-cols-5 gap-3">
+          {WAREHOUSES.map(w => {
+            const st = state.warehouses[w.id]; const open = dec.warehouseOpen[w.id];
+            const arr = inTransit(state).filter(s => s.wh === w.id);
+            return (
+              <div key={w.id} className={`border rounded-lg p-3 text-sm ${open ? 'border-blue-400 bg-blue-50' : 'border-slate-200'}`}>
+                <label className="font-semibold flex items-center gap-2"><input type="checkbox" checked={open} onChange={e => upd(d => { d.warehouseOpen[w.id] = e.target.checked; })} />{w.name.replace(' Warehouse', '')}</label>
+                <div className="text-xs text-slate-600 mt-1">{st.open ? `On hand: A ${st.inv.A} / B ${st.inv.B}` : (open ? 'Will open' : 'Closed')}</div>
+                {arr.length > 0 && <div className="text-xs text-indigo-700 mt-1">On the way: {PRODUCTS.map(p => { const q = sum(arr.filter(s => s.p === p.id).map(s => s.qty)); return q ? `${p.short} ${q}` : null; }).filter(Boolean).join(', ')}</div>}
+              </div>);
+          })}
+        </div>
+      </Card>
+
+      <Card title="3. Shipments: factory → warehouse">
+        <p className="text-xs text-slate-600 mb-3">Standard shipping arrives {PARAMS.leadStd} rounds after sending (start of round {arriveRound(round, 'std')}); ⚡ express arrives after {PARAMS.leadExp} round (start of round {arriveRound(round, 'exp')}) and costs ×{PARAMS.expMult}. Only goods that are already in a warehouse when the round is played can be sold. You can ship only what is at the factory (stock + this round's production).</p>
+        {FACTORIES.filter(f => dec.factoryOpen[f.id]).map(f => (
+          <div key={f.id} className="mb-5">
+            <div className="font-semibold text-sm mb-1">{f.name}
+              <span className="font-normal text-xs text-slate-500"> — available: {PRODUCTS.map(p => `${p.short} ${stockNow(f.id, p.id) + prod[f.id][p.id] - shippedQ(f.id, p.id)}`).join(' · ')} (left to ship)</span></div>
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm">
+                <thead className="bg-slate-50 text-slate-600"><tr>
+                  <th className="text-left px-2 py-1">To warehouse</th>
+                  {PRODUCTS.map(p => <th key={p.id} className="px-2 py-1" colSpan="2"><ProdBadge id={p.id} /> units · mode</th>)}
+                </tr></thead>
+                <tbody>
+                  {openWh.map(w => (
+                    <tr key={w.id} className="border-t">
+                      <td className="px-2 py-1">{w.name.replace(' Warehouse', '')}</td>
+                      {PRODUCTS.map(p => {
+                        const k = shipKey(f.id, w.id, p.id); const l = dec.ship[k] || { qty: 0, mode: 'std' };
+                        const left = stockNow(f.id, p.id) + prod[f.id][p.id] - shippedQ(f.id, p.id);
+                        return (<React.Fragment key={p.id}>
+                          <td className="px-1 py-1 text-right"><NumInput value={l.qty} max={Math.max(0, toInt(l.qty)) + Math.max(0, left)} onChange={v => upd(d => { d.ship[k] = { qty: v, mode: (d.ship[k] || {}).mode || 'std' }; })} /></td>
+                          <td className="px-1 py-1">
+                            <select value={l.mode} onChange={e => upd(d => { d.ship[k] = { qty: (d.ship[k] || {}).qty || 0, mode: e.target.value }; })} className="border border-slate-300 rounded px-1 py-1 text-xs">
+                              <option value="std">Std £{r2(shipRate(f, w, 'std', p))}→R{arriveRound(round, 'std')}</option>
+                              <option value="exp">⚡ Exp £{r2(shipRate(f, w, 'exp', p))}→R{arriveRound(round, 'exp')}</option>
+                            </select>
+                          </td>
+                        </React.Fragment>);
+                      })}
+                    </tr>))}
+                </tbody>
+              </table>
+            </div>
+          </div>))}
+        {!FACTORIES.some(f => dec.factoryOpen[f.id]) && <p className="text-sm text-red-600">No factory is open.</p>}
+        <div className="text-xs text-slate-500">Unit costs shown in the drop-downs are per unit (the full rate table is on the Game info tab).</div>
+      </Card>
+
+      <Card title="4. Which warehouse serves each region?">
+        <p className="text-xs text-slate-600 mb-3">Each region buys both products from ONE warehouse. Delivery cost per unit grows with distance (B costs ×{PRODUCTS[1].delMult}). If a warehouse runs out, the unmet demand is lost and you pay the stock-out penalty.</p>
+        <div className="grid md:grid-cols-5 gap-3">
+          {REGIONS.map(r => {
+            const sel = dec.assign[r.id]; const w = WAREHOUSES.find(x => x.id === sel);
+            const ok = w && dec.warehouseOpen[w.id];
+            return (
+              <div key={r.id} className="border rounded-lg p-3 text-sm">
+                <div className="font-semibold">{r.name}</div>
+                {lastHist && <div className="text-xs text-slate-500">Last demand: {PRODUCTS.map(p => `${p.short} ${lastHist.demand[p.id][REGIONS.indexOf(r)]}`).join(' / ')}</div>}
+                <select value={sel} onChange={e => upd(d => { d.assign[r.id] = e.target.value; })} className={`mt-1 w-full border rounded px-1 py-1 ${ok ? 'border-slate-300' : 'border-red-400 bg-red-50'}`}>
+                  {WAREHOUSES.map(x => <option key={x.id} value={x.id}>{x.name.replace(' Warehouse', '')}{dec.warehouseOpen[x.id] ? '' : ' (closed)'}</option>)}
+                </select>
+                {w && <div className="text-xs text-slate-500 mt-1">Delivery: {PRODUCTS.map(p => `${p.short} £${r2(deliverRate(w, r, p))}`).join(' / ')}</div>}
+                {!ok && <div className="text-xs text-red-600 mt-1">Warehouse closed: no sales!</div>}
+              </div>);
+          })}
+        </div>
+      </Card>
+
+      <Card title="Summary and submit">
+        <div className="grid md:grid-cols-2 gap-5">
+          <div className="text-sm space-y-1">
+            <div className="flex justify-between"><span>Opening investments</span><b>{money(costs.invest)}</b></div>
+            <div className="flex justify-between"><span>Fixed upkeep</span><b>{money(costs.fixed)}</b></div>
+            <div className="flex justify-between"><span>Production</span><b>{money(costs.production)}</b></div>
+            <div className="flex justify-between"><span>Factory → warehouse transport</span><b>{money(costs.transport)}</b></div>
+            <div className="flex justify-between border-t pt-1"><span>Committed before sales</span><b>{money(costs.total)}</b></div>
+            <div className="flex justify-between text-slate-500"><span>Cash now</span><span>{money(state.cash)}</span></div>
+            {state.cash - costs.total < 0 && <p className="text-xs text-red-600">Your cash would go negative before sales. Negative cash is charged {PARAMS.interest * 100}% interest next round.</p>}
+            <p className="text-xs text-slate-500 pt-1">Holding costs, delivery costs and stock-out penalties are charged when the round is played.</p>
+          </div>
+          <div>
+            <div className="text-sm font-semibold mb-1">Arrival plan including this draft</div>
+            <ArrivalPlan state={state} dec={dec} round={round} />
+          </div>
+        </div>
+        <button onClick={submit} className="mt-4 bg-indigo-600 text-white px-6 py-2 rounded font-semibold hover:bg-indigo-700">{submitted ? 'Resubmit decisions' : 'Submit decisions'}</button>
+        {msg && <span className="ml-3 text-sm text-green-700">{msg}</span>}
+      </Card>
+    </div>
+  );
+}
+
+/* ============================ RESULTS ============================ */
+function ResultsTab({ state }) {
+  const h = state.history;
+  if (!h.length) return <Card title="Results">No round has been played yet. Results appear after the instructor closes round 1.</Card>;
+  const rows = [
+    ['Revenue product A', x => x.prodRev.A, 1], ['Revenue product B', x => x.prodRev.B, 1],
+    ['Opening investments', x => -x.invest], ['Fixed upkeep', x => -x.fixed], ['Production', x => -x.production],
+    ['Factory → warehouse transport', x => -x.transport], ['Delivery to customers', x => -x.delivery],
+    ['Holding costs', x => -x.holding], ['Stock-out penalties', x => -x.penalty], ['Interest', x => -x.interest],
+    ['Net result', x => x.net, 2], ['Cash at end', x => x.cash, 2],
+  ];
+  return (
+    <div>
+      <Card title="Financial results by round">
+        <div className="overflow-x-auto"><table className="w-full text-sm">
+          <thead className="bg-slate-50 text-slate-600"><tr><th className="text-left px-2 py-1"></th>{h.map(x => <th key={x.round} className="px-2 py-1 text-right">Round {x.round}</th>)}</tr></thead>
+          <tbody>{rows.map(([label, fn, b]) => (
+            <tr key={label} className={`border-t ${b === 2 ? 'font-bold bg-slate-50' : ''}`}>
+              <td className="px-2 py-1">{label}</td>
+              {h.map(x => { const v = fn(x); return <td key={x.round} className={`px-2 py-1 text-right ${v < 0 ? 'text-red-600' : ''}`}>{money(v)}</td>; })}
+            </tr>))}</tbody>
+        </table></div>
+      </Card>
+      <Card title="Service: demand, sales and lost sales">
+        {[...h].reverse().map(x => (
+          <div key={x.round} className="mb-4">
+            <div className="font-semibold text-sm mb-1">Round {x.round}</div>
+            <div className="overflow-x-auto"><table className="w-full text-sm">
+              <thead className="bg-slate-50 text-slate-600"><tr><th className="text-left px-2 py-1"></th>{REGIONS.map(r => <th key={r.id} className="px-2 py-1 text-right">{r.name}</th>)}<th className="px-2 py-1 text-right">Service level</th></tr></thead>
+              <tbody>{PRODUCTS.map(p => {
+                const d = sum(x.demand[p.id]), s = sum(x.sold[p.id]);
+                return (<React.Fragment key={p.id}>
+                  <tr className="border-t text-right"><td className="px-2 py-1 text-left"><ProdBadge id={p.id} /> demand</td>{x.demand[p.id].map((v, i) => <td key={i} className="px-2 py-1">{v}</td>)}<td className="px-2 py-1" rowSpan="2"><b>{d ? Math.round(s / d * 100) : 100}%</b></td></tr>
+                  <tr className="text-right"><td className="px-2 py-1 text-left text-slate-500">sold / <span className="text-red-600">lost</span></td>{x.sold[p.id].map((v, i) => <td key={i} className="px-2 py-1">{v} / <span className={x.lost[p.id][i] ? 'text-red-600' : 'text-slate-400'}>{x.lost[p.id][i]}</span></td>)}</tr>
+                </React.Fragment>);
+              })}</tbody>
+            </table></div>
+          </div>))}
+      </Card>
+    </div>
+  );
+}
+
+/* ============================ GAME INFO ============================ */
+function InfoTab({ game, state }) {
+  const realized = [];
+  for (let r = 1; r < Math.min(game.round, game.totalRounds + 1); r++) realized.push({ round: r, demand: demandForGame(game, r) });
+  const P = paramsForRound(game, game.round);
+  return (
+    <div>
+      <NewsBox game={game} />
+      <MapCard />
+      <Card title="How the game works">
+        <ul className="list-disc ml-5 text-sm space-y-1 text-slate-700">
+          <li>Each round you decide: which factories/warehouses are open, how much of each product to produce, what to ship where (standard or express), and which warehouse serves each region.</li>
+          <li>When the instructor closes the round, everyone's decisions are played against the same demand. Your score is your <b>cash</b> at the end.</li>
+          <li><b>Standard shipping takes {PARAMS.leadStd} rounds</b>, express takes {PARAMS.leadExp} round and costs ×{PARAMS.expMult}. Goods in transit cannot be sold (see the Shipments tab).</li>
+          <li>Unmet demand is lost and you pay a <b>stock-out penalty</b> per unit. Surplus stock costs holding money each round.</li>
+          <li>Demand has trends and seasonality, and <b>the pattern can change during the game</b>.</li>
+        </ul>
+      </Card>
+      <Card title="Products">
+        <div className="overflow-x-auto"><table className="w-full text-sm">
+          <thead className="bg-slate-50 text-slate-600"><tr><th className="text-left px-2 py-1"></th><th className="px-2 py-1">Price now</th><th className="px-2 py-1">Stock-out penalty now</th><th className="px-2 py-1">Holding factory</th><th className="px-2 py-1">Holding warehouse</th><th className="px-2 py-1">Capacity per unit</th><th className="px-2 py-1">Shipping &amp; delivery multiplier</th></tr></thead>
+          <tbody>{PRODUCTS.map(p => (
+            <tr key={p.id} className="border-t text-center"><td className="px-2 py-1 text-left"><ProdBadge id={p.id} /> {p.name}</td><td>{money(P.price[p.id])}</td><td>{money(P.penalty[p.id])}</td><td>£{p.holdF}</td><td>£{p.holdW}</td><td>{p.capUse}</td><td>×{p.shipMult}</td></tr>))}</tbody>
+        </table></div>
+      </Card>
+      <Card title="Factories: capacity and unit production cost">
+        <div className="overflow-x-auto"><table className="w-full text-sm">
+          <thead className="bg-slate-50 text-slate-600"><tr><th className="text-left px-2 py-1">Factory</th><th>Capacity</th><th>Cost A (now)</th><th>Cost B (now)</th></tr></thead>
+          <tbody>{FACTORIES.map(f => <tr key={f.id} className="border-t text-center"><td className="px-2 py-1 text-left">{f.name}</td><td>{f.cap}</td><td>£{P.unitCost[f.id].A}</td><td>£{P.unitCost[f.id].B}</td></tr>)}</tbody>
+        </table></div>
+        <p className="text-xs text-slate-500 mt-2">Opening a factory {money(PARAMS.openFactory)} · upkeep {money(PARAMS.fixedFactory)}/round · warehouse {money(PARAMS.openWarehouse)} · upkeep {money(PARAMS.fixedWarehouse)}/round.</p>
+      </Card>
+      <Card title="Transport cost per unit of product A (product B ×1.6)">
+        <div className="overflow-x-auto"><table className="w-full text-sm">
+          <thead className="bg-slate-50 text-slate-600"><tr><th className="text-left px-2 py-1">Factory → Warehouse</th>{WAREHOUSES.map(w => <th key={w.id} className="px-2 py-1">{w.name.replace(' Warehouse', '')}</th>)}</tr></thead>
+          <tbody>{FACTORIES.map(f => <tr key={f.id} className="border-t text-center"><td className="px-2 py-1 text-left">{f.name}</td>{WAREHOUSES.map(w => <td key={w.id}>£{r2(shipRate(f, w, 'std', PRODUCTS[0]))} / ⚡£{r2(shipRate(f, w, 'exp', PRODUCTS[0]))}</td>)}</tr>)}</tbody>
+        </table></div>
+        <div className="font-semibold text-sm mt-4 mb-1">Delivery cost per unit of product A to customers (B ×1.6)</div>
+        <div className="overflow-x-auto"><table className="w-full text-sm">
+          <thead className="bg-slate-50 text-slate-600"><tr><th className="text-left px-2 py-1">Warehouse → Region</th>{REGIONS.map(r => <th key={r.id} className="px-2 py-1">{r.name}</th>)}</tr></thead>
+          <tbody>{WAREHOUSES.map(w => <tr key={w.id} className="border-t text-center"><td className="px-2 py-1 text-left">{w.name.replace(' Warehouse', '')}</td>{REGIONS.map(r => <td key={r.id}>£{r2(deliverRate(w, r, PRODUCTS[0]))}</td>)}</tr>)}</tbody>
+        </table></div>
+      </Card>
+      <Card title="Demand">
+        <DemandHistory seed={game.seed} realized={realized} bare />
+      </Card>
+    </div>
+  );
+}
+
+/* ============================ INSTRUCTOR ============================ */
+function useDB(path) {
+  const [v, setV] = useState(undefined);
+  useEffect(() => {
+    const r = db.ref(path);
+    const cb = r.on('value', s => setV(s.val()));
+    return () => r.off('value', cb);
+  }, [path]);
+  return v;
+}
+
+function ChangesCard({ game }) {
+  const [from, setFrom] = useState(Math.min(game.round + 1, game.totalRounds));
+  const [f, setF] = useState({});
+  const [msg, setMsg] = useState('');
+  const [saved, setSaved] = useState('');
+  const P = paramsForRound(game, from);
+  const existing = (game.changes || {})['r' + from] || {};
+  const get = (grp, k) => (f[grp + '.' + k] !== undefined ? f[grp + '.' + k] : (((existing[grp] || {})[k]) !== undefined ? existing[grp][k] : ''));
+  const set = (grp, k, v) => setF({ ...f, [grp + '.' + k]: v });
+  useEffect(() => { setF({}); setMsg(existing.msg || ''); }, [from]);
+
+  const save = async () => {
+    const out = { demandPct: {}, penalty: {}, price: {}, unitCost: {}, msg: msg || '' };
+    const take = (grp, k) => { const v = get(grp, k); if (v !== '' && v !== null && !isNaN(Number(v))) out[grp][k] = Number(v); };
+    PRODUCTS.forEach(p => { take('penalty', p.id); take('price', p.id); REGIONS.forEach(r => take('demandPct', p.id + '_' + r.id)); FACTORIES.forEach(fa => take('unitCost', fa.id + '_' + p.id)); });
+    await db.ref('game/changes/r' + from).set(out);
+    setSaved('Saved: applies from round ' + from + ' onwards.');
+  };
+  const clear = async () => { await db.ref('game/changes/r' + from).set(null); setF({}); setMsg(''); setSaved('Cleared.'); };
+  const cell = (grp, k, ph) => <input type="number" value={get(grp, k)} placeholder={ph} onChange={e => set(grp, k, e.target.value)} className="w-20 px-1 py-1 border border-slate-300 rounded text-right text-sm" />;
+
+  return (
+    <Card title="⚙️ Change parameters between rounds">
+      <p className="text-xs text-slate-600 mb-3">Changes saved for round N apply to round N and all later rounds (until another change overrides them). Leave a field empty to keep the current value. Demand is in % of the base demand (100 = no change).</p>
+      <div className="mb-3 text-sm">Applies from round: <select value={from} onChange={e => setFrom(toInt(e.target.value))} className="border rounded px-2 py-1">
+        {Array.from({ length: game.totalRounds }, (_, i) => i + 1).filter(r => r >= game.round).map(r => <option key={r} value={r}>{r}</option>)}</select></div>
+      <div className="overflow-x-auto mb-3"><table className="text-sm">
+        <thead><tr><th className="px-2 text-left">Demand %</th>{REGIONS.map(r => <th key={r.id} className="px-2">{r.name}</th>)}</tr></thead>
+        <tbody>{PRODUCTS.map(p => <tr key={p.id}><td className="px-2"><ProdBadge id={p.id} /></td>{REGIONS.map(r => <td key={r.id} className="px-1 py-1">{cell('demandPct', p.id + '_' + r.id, '100')}</td>)}</tr>)}</tbody>
+      </table></div>
+      <div className="grid md:grid-cols-2 gap-4 mb-3 text-sm">
+        <div>
+          <div className="font-semibold mb-1">Stock-out penalty / Selling price (£)</div>
+          {PRODUCTS.map(p => <div key={p.id} className="flex items-center gap-2 mb-1"><ProdBadge id={p.id} /> penalty {cell('penalty', p.id, P.penalty[p.id])} price {cell('price', p.id, P.price[p.id])}</div>)}
+        </div>
+        <div>
+          <div className="font-semibold mb-1">Production cost per unit (£)</div>
+          {FACTORIES.map(fa => <div key={fa.id} className="flex items-center gap-2 mb-1"><span className="w-20">{fa.name.split(' (')[0]}</span>{PRODUCTS.map(p => <span key={p.id} className="flex items-center gap-1"><ProdBadge id={p.id} />{cell('unitCost', fa.id + '_' + p.id, P.unitCost[fa.id][p.id])}</span>)}</div>)}
+        </div>
+      </div>
+      <textarea value={msg} onChange={e => setMsg(e.target.value)} placeholder="Optional news message shown to all teams" className="w-full border rounded p-2 text-sm mb-3" rows="2" />
+      <button onClick={save} className="bg-indigo-600 text-white px-4 py-2 rounded font-semibold mr-2">Save changes</button>
+      <button onClick={clear} className="bg-slate-200 px-4 py-2 rounded">Clear for round {from}</button>
+      {saved && <span className="ml-3 text-sm text-green-700">{saved}</span>}
+    </Card>
+  );
+}
+
+function Instructor({ onExit }) {
+  const [ok, setOk] = useState(false);
+  const [pw, setPw] = useState('');
+  const game = useDB('game');
+  const lb = useDB('leaderboard');
+  const decisions = useDB('decisions');
+  const teams = useDB('teams');
+  const [busy, setBusy] = useState(false);
+  const [form, setForm] = useState({ totalRounds: 8, seed: 1234, shiftRound: DEFAULT_SHIFT_ROUND, announceShift: false });
+  const [note, setNote] = useState('');
+
+  if (!ok) return (
+    <div className="min-h-screen flex items-center justify-center p-6">
+      <div className="bg-white rounded-xl shadow p-8 w-96">
+        <h2 className="text-xl font-bold mb-3">Instructor login</h2>
+        <input type="password" value={pw} onChange={e => setPw(e.target.value)} onKeyDown={e => { if (e.key === 'Enter' && pw === INSTRUCTOR_PASSWORD) setOk(true); }} placeholder="Password" className="w-full border rounded px-3 py-2 mb-3" />
+        <button onClick={() => pw === INSTRUCTOR_PASSWORD ? setOk(true) : setNote('Wrong password')} className="w-full bg-indigo-600 text-white py-2 rounded font-semibold">Enter</button>
+        {note && <p className="text-red-600 text-sm mt-2">{note}</p>}
+        <button onClick={onExit} className="text-xs text-slate-500 underline mt-4">Back</button>
+      </div>
+    </div>);
+
+  const startGame = async () => {
+    if (game && !confirm('This deletes the running game and all teams. Continue?')) return;
+    setBusy(true);
+    await db.ref('').set(null);
+    await db.ref('game').set({ round: 1, totalRounds: toInt(form.totalRounds) || 8, seed: toInt(form.seed) || 1234, shiftRound: toInt(form.shiftRound) || DEFAULT_SHIFT_ROUND, announceShift: !!form.announceShift });
+    setBusy(false);
+  };
+  const advance = async () => {
+    if (game.round > game.totalRounds) return;
+    if (!confirm(`Close round ${game.round}? Teams that have not submitted repeat their previous decisions.`)) return;
+    setBusy(true);
+    const g = { ...game, round: game.round + 1 };
+    await db.ref('game/round').set(g.round);
+    await syncAllTeams(g);
+    setBusy(false);
+  };
+  const saveSettings = async patch => { await db.ref('game').update(patch); };
+  const backup = async () => { const s = await db.ref('').once('value'); download('supply-backup.json', JSON.stringify(s.val() || {}, null, 1), 'application/json'); };
+  const restore = async e => {
+    const file = e.target.files[0]; if (!file) return;
+    const txt = await file.text(); await db.ref('').set(JSON.parse(txt)); setNote('Backup restored.');
+  };
+  const csv = () => {
+    const rows = [['team', 'cash', 'rounds'], ...Object.values(lb || {}).sort((a, b) => b.cash - a.cash).map(t => [t.name, t.cash, t.rounds])];
+    download('leaderboard.csv', rows.map(r => r.join(',')).join('\n'), 'text/csv');
+  };
+  const rows = Object.keys(lb || {}).map(id => ({ id, ...lb[id] }));
+  const submittedCount = game && teams ? Object.keys(teams).filter(id => decisions && decisions[id] && decisions[id]['r' + game.round]).length : 0;
+
+  return (
+    <div className="min-h-screen p-6"><div className="max-w-5xl mx-auto">
+      <div className="flex justify-between items-center mb-5"><h1 className="text-2xl font-bold">🎓 Instructor panel</h1><button onClick={onExit} className="text-sm underline">Leave</button></div>
+      {note && <p className="text-sm text-green-700 mb-3">{note}</p>}
+      <Card title="Game status">
+        {game ? (<>
+          <p className="mb-3">Round <b>{Math.min(game.round, game.totalRounds)}</b> of {game.totalRounds}{game.round > game.totalRounds ? ' — finished' : ''} · {Object.keys(teams || {}).length} teams · submitted this round: <b>{submittedCount}</b></p>
+          <button disabled={busy || game.round > game.totalRounds} onClick={advance} className="bg-emerald-600 disabled:bg-slate-300 text-white px-5 py-2 rounded font-semibold">{game.round >= game.totalRounds ? 'Close final round' : `Close round ${game.round} and open round ${game.round + 1}`}</button>
+          {busy && <span className="ml-3 text-sm text-slate-500">Processing…</span>}
+          <div className="mt-4 pt-4 border-t text-sm flex flex-wrap gap-4 items-center">
+            <label>Demand profile changes at round <input type="number" disabled={game.round >= (game.shiftRound || DEFAULT_SHIFT_ROUND)} value={game.shiftRound || DEFAULT_SHIFT_ROUND} onChange={e => saveSettings({ shiftRound: toInt(e.target.value) })} className="w-16 border rounded px-1 py-1 ml-1 disabled:bg-slate-100" /></label>
+            <label><input type="checkbox" checked={!!game.announceShift} onChange={e => saveSettings({ announceShift: e.target.checked })} /> announce the shift to students (news appears one round before)</label>
+            <span className="text-xs text-slate-500">The shift round can only be edited before it has started.</span>
+          </div>
+        </>) : <p className="text-slate-500">No game yet.</p>}
+      </Card>
+      <Card title={game ? 'Start a new game (deletes the current one)' : 'Create the game'}>
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-sm mb-3">
+          <label>Rounds<input type="number" value={form.totalRounds} onChange={e => setForm({ ...form, totalRounds: e.target.value })} className="w-full border rounded px-2 py-1" /></label>
+          <label>Random seed<input type="number" value={form.seed} onChange={e => setForm({ ...form, seed: e.target.value })} className="w-full border rounded px-2 py-1" /></label>
+          <label>Demand shift at round<input type="number" value={form.shiftRound} onChange={e => setForm({ ...form, shiftRound: e.target.value })} className="w-full border rounded px-2 py-1" /></label>
+          <label className="flex items-end gap-2"><input type="checkbox" checked={form.announceShift} onChange={e => setForm({ ...form, announceShift: e.target.checked })} /> announce shift</label>
+        </div>
+        <button disabled={busy} onClick={startGame} className="bg-indigo-600 text-white px-5 py-2 rounded font-semibold">{game ? 'Delete everything and start new game' : 'Create game'}</button>
+      </Card>
+      {game && <ChangesCard key={game.round} game={game} />}
+      <Card title="Teams and leaderboard"><Leaderboard rows={rows} /></Card>
+      <Card title="Backup">
+        <button onClick={backup} className="bg-slate-200 px-4 py-2 rounded mr-2">Download backup (JSON)</button>
+        <button onClick={csv} className="bg-slate-200 px-4 py-2 rounded mr-2">Leaderboard CSV</button>
+        <label className="text-sm">Restore: <input type="file" accept=".json" onChange={restore} /></label>
+      </Card>
+    </div></div>
+  );
+}
+
+/* ============================== TEAM VIEW ============================== */
+const TABS = [['dec', '📝 Decisions'], ['ship', '🚚 Shipments'], ['res', '📊 Results'], ['info', '🗺️ Game info & demand'], ['lb', '🏆 Leaderboard']];
+function TeamView({ team, game, leaderboard, onLogout }) {
+  const [tab, setTab] = useState('dec');
+  const [state, setState] = useState(null);
+  useEffect(() => {
+    let off = null; let alive = true;
+    (async () => {
+      await syncTeam(team.id, game);
+      if (!alive) return;
+      const r = db.ref('state/' + team.id);
+      const cb = r.on('value', s => { const v = s.val(); if (v) setState(JSON.parse(v.json)); });
+      off = () => r.off('value', cb);
+    })();
+    return () => { alive = false; if (off) off(); };
+  }, [team.id, game.round]);
+  if (!state) return <p className="p-6 text-slate-500">Loading your team…</p>;
+  const rank = [...leaderboard].sort((a, b) => b.cash - a.cash).findIndex(t => t.id === team.id) + 1;
+  return (
+    <div className="min-h-screen p-4"><div className="max-w-5xl mx-auto">
+      <div className="bg-white rounded-xl shadow p-4 mb-4 flex flex-wrap justify-between items-center gap-3">
+        <div><div className="text-xl font-bold">{team.name}</div><div className="text-sm text-slate-500">Round {Math.min(game.round, game.totalRounds)} of {game.totalRounds}{game.round > game.totalRounds ? ' (finished)' : ''}</div></div>
+        <div className="text-right"><div className={`text-2xl font-bold ${state.cash >= 0 ? 'text-green-700' : 'text-red-600'}`}>{money(state.cash)}</div><div className="text-sm text-slate-500">Rank {rank || '-'} / {leaderboard.length}</div></div>
+        <button onClick={onLogout} className="text-sm underline text-slate-500">Log out</button>
+      </div>
+      <div className="flex flex-wrap gap-2 mb-4">
+        {TABS.map(([k, l]) => <button key={k} onClick={() => setTab(k)} className={`px-4 py-2 rounded-lg text-sm font-semibold ${tab === k ? 'bg-indigo-600 text-white' : 'bg-white text-slate-700 shadow'}`}>{l}</button>)}
+      </div>
+      {tab === 'dec' && <DecisionTab team={team} state={state} game={game} />}
+      {tab === 'ship' && <ShipmentsTab state={state} game={game} />}
+      {tab === 'res' && <ResultsTab state={state} />}
+      {tab === 'info' && <InfoTab game={game} state={state} />}
+      {tab === 'lb' && <Card title="🏆 Leaderboard (ranked by cash)"><Leaderboard rows={leaderboard} myId={team.id} /></Card>}
+    </div></div>
+  );
+}
+
+/* ================================ APP ================================ */
+function App() {
+  const game = useDB('game');
+  const lbRaw = useDB('leaderboard');
+  const [team, setTeam] = useState(() => { try { return JSON.parse(localStorage.getItem('supply2-team') || 'null'); } catch (e) { return null; } });
+  const [inst, setInst] = useState(false);
+  const leaderboard = Object.keys(lbRaw || {}).map(id => ({ id, ...lbRaw[id] }));
+  const login = t => { try { localStorage.setItem('supply2-team', JSON.stringify(t)); } catch (e) {} setTeam(t); };
+  const logout = () => { try { localStorage.removeItem('supply2-team'); } catch (e) {} setTeam(null); };
+  if (game === undefined) return <p className="p-6 text-slate-500">Connecting…</p>;
+  if (inst) return <Instructor onExit={() => setInst(false)} />;
+  if (team && game) return <TeamView team={team} game={game} leaderboard={leaderboard} onLogout={logout} />;
+  return <Login game={game} leaderboard={leaderboard} onLogin={login} onInstructor={() => setInst(true)} />;
+}
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+
+</script></body></html>
